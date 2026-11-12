@@ -144,6 +144,7 @@ void StreamServerComponent::read() {
 void StreamServerComponent::flush() {
     ssize_t written;
     this->buf_tail_ = this->buf_head_;
+
     for (Client &client : this->clients_) {
         if (client.disconnected || client.position == this->buf_head_)
             continue;
@@ -155,16 +156,23 @@ void StreamServerComponent::flush() {
         iov[0].iov_len = std::min(this->buf_head_ - client.position, this->buf_ahead(client.position));
         iov[1].iov_base = &this->buf_[0];
         iov[1].iov_len = this->buf_head_ - (client.position + iov[0].iov_len);
+
         if ((written = client.socket->writev(iov, 2)) > 0) {
             client.position += written;
         } else if (written == 0 || errno == ECONNRESET || errno == ENOTCONN || errno == ENETRESET) {
             ESP_LOGD(TAG, "Client %s disconnected", client.identifier.c_str());
             client.disconnected = true;
-            continue;  // don't consider this client when calculating the tail position
-        } else if (errno == EWOULDBLOCK || errno == EAGAIN) {
-            // Expected if the (TCP) transmit buffer is full, nothing to do.
+            continue;
+        } else if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) {
+            // Temporary socket condition; try again on the next loop.
         } else {
-            ESP_LOGE(TAG, "Failed to write to client %s with error %d!", client.identifier.c_str(), errno);
+            const int socket_error = errno;
+
+            ESP_LOGE(TAG, "Failed to write to client %s with error %d! Closing connection.",
+                     client.identifier.c_str(), socket_error);
+
+            client.disconnected = true;
+            continue;
         }
 
         this->buf_tail_ = std::min(this->buf_tail_, client.position);
@@ -173,22 +181,38 @@ void StreamServerComponent::flush() {
 
 void StreamServerComponent::write() {
     uint8_t buf[128];
-    ssize_t read;
+    ssize_t bytes_read;
+
     for (Client &client : this->clients_) {
         if (client.disconnected)
             continue;
 
-        while ((read = client.socket->read(&buf, sizeof(buf))) > 0)
-            this->stream_->write_array(buf, read);
+        while ((bytes_read = client.socket->read(buf, sizeof(buf))) > 0)
+            this->stream_->write_array(buf, bytes_read);
 
-        if (read == 0 || errno == ECONNRESET || errno == ENOTCONN || errno == ENETRESET) {
+        if (bytes_read == 0) {
             ESP_LOGD(TAG, "Client %s disconnected", client.identifier.c_str());
             client.disconnected = true;
-        } else if (errno == EWOULDBLOCK || errno == EAGAIN) {
-            // Expected if the (TCP) receive buffer is empty, nothing to do.
-        } else {
-            ESP_LOGW(TAG, "Failed to read from client %s with error %d!", client.identifier.c_str(), errno);
+            continue;
         }
+
+        const int socket_error = errno;
+
+        if (socket_error == ECONNRESET || socket_error == ENOTCONN || socket_error == ENETRESET) {
+            ESP_LOGD(TAG, "Client %s disconnected with error %d", client.identifier.c_str(), socket_error);
+            client.disconnected = true;
+            continue;
+        }
+
+        if (socket_error == EWOULDBLOCK || socket_error == EAGAIN || socket_error == EINTR) {
+            // Temporary socket condition; try again on the next loop.
+            continue;
+        }
+
+        ESP_LOGW(TAG, "Failed to read from client %s with error %d! Closing connection.",
+                 client.identifier.c_str(), socket_error);
+
+        client.disconnected = true;
     }
 }
 
