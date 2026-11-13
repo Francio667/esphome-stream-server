@@ -66,10 +66,10 @@ protected:
     size_t buf_size_;
 
 #ifdef USE_BINARY_SENSOR
-    esphome::binary_sensor::BinarySensor *connected_sensor_;
+    esphome::binary_sensor::BinarySensor *connected_sensor_{nullptr};
 #endif
 #ifdef USE_SENSOR
-    esphome::sensor::Sensor *connection_count_sensor_;
+    esphome::sensor::Sensor *connection_count_sensor_{nullptr};
 #endif
 
     std::unique_ptr<uint8_t[]> buf_{};
