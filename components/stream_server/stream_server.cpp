@@ -1,5 +1,7 @@
 #include "stream_server.h"
 
+#include <cerrno>
+
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 #include "esphome/core/util.h"
@@ -18,23 +20,66 @@ void StreamServerComponent::setup() {
     // The make_unique() wrapper doesn't like arrays, so initialize the unique_ptr directly.
     this->buf_ = std::unique_ptr<uint8_t[]>{new uint8_t[this->buf_size_]};
 
-    struct sockaddr_storage bind_addr;
+    struct sockaddr_storage bind_addr{};
 #if ESPHOME_VERSION_CODE >= VERSION_CODE(2023, 4, 0)
     socklen_t bind_addrlen = socket::set_sockaddr_any(reinterpret_cast<struct sockaddr *>(&bind_addr), sizeof(bind_addr), this->port_);
 #else
     socklen_t bind_addrlen = socket::set_sockaddr_any(reinterpret_cast<struct sockaddr *>(&bind_addr), sizeof(bind_addr), htons(this->port_));
 #endif
+    if (bind_addrlen == 0) {
+        const int socket_error = errno;
+        ESP_LOGE(TAG, "Failed to prepare TCP bind address for port %u (errno %d)", this->port_, socket_error);
+        this->mark_failed();
+        return;
+    }
 
-#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 3, 0)    
-    this->socket_ = socket::socket_ip_loop_monitored(SOCK_STREAM, PF_INET).release();    
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 3, 0)
+    this->socket_ = socket::socket_ip_loop_monitored(SOCK_STREAM, PF_INET).release();
 #else
     this->socket_ = socket::socket_ip(SOCK_STREAM, PF_INET);
-#endif 
-      
-    this->socket_->setblocking(false);
-    this->socket_->bind(reinterpret_cast<struct sockaddr *>(&bind_addr), bind_addrlen);
-    this->socket_->listen(8);
+#endif
 
+    if (this->socket_ == nullptr) {
+        const int socket_error = errno;
+        ESP_LOGE(TAG, "Failed to create TCP listening socket on port %u (errno %d)", this->port_, socket_error);
+        this->mark_failed();
+        return;
+    }
+
+    auto close_listen_socket = [this]() {
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 3, 0)
+        delete this->socket_;
+        this->socket_ = nullptr;
+#else
+        this->socket_.reset();
+#endif
+    };
+
+    if (this->socket_->setblocking(false) != 0) {
+        const int socket_error = errno;
+        ESP_LOGE(TAG, "Failed to set TCP listening socket non-blocking (errno %d)", socket_error);
+        close_listen_socket();
+        this->mark_failed();
+        return;
+    }
+
+    if (this->socket_->bind(reinterpret_cast<struct sockaddr *>(&bind_addr), bind_addrlen) != 0) {
+        const int socket_error = errno;
+        ESP_LOGE(TAG, "Failed to bind TCP port %u (errno %d)", this->port_, socket_error);
+        close_listen_socket();
+        this->mark_failed();
+        return;
+    }
+
+    if (this->socket_->listen(8) != 0) {
+        const int socket_error = errno;
+        ESP_LOGE(TAG, "Failed to listen on TCP port %u (errno %d)", this->port_, socket_error);
+        close_listen_socket();
+        this->mark_failed();
+        return;
+    }
+
+    ESP_LOGCONFIG(TAG, "TCP stream server listening on port %u", this->port_);
     this->publish_sensor();
 }
 
@@ -67,8 +112,10 @@ void StreamServerComponent::on_shutdown() {
     this->socket_ = nullptr;    
 #endif 
 
-    for (const Client &client : this->clients_)
-        client.socket->shutdown(SHUT_RDWR);
+    for (const Client &client : this->clients_) {
+        if (client.socket)
+            client.socket->shutdown(SHUT_RDWR);
+    }
 }
 
 void StreamServerComponent::publish_sensor() {
@@ -83,13 +130,21 @@ void StreamServerComponent::publish_sensor() {
 }
 
 void StreamServerComponent::accept() {
-    struct sockaddr_storage client_addr;
+    if (this->socket_ == nullptr)
+        return;
+
+    struct sockaddr_storage client_addr{};
     socklen_t client_addrlen = sizeof(client_addr);
     std::unique_ptr<socket::Socket> socket = this->socket_->accept(reinterpret_cast<struct sockaddr *>(&client_addr), &client_addrlen);
     if (!socket)
         return;
 
-    socket->setblocking(false);
+    if (socket->setblocking(false) != 0) {
+        const int socket_error = errno;
+        ESP_LOGW(TAG, "Rejecting newly accepted client: failed to set non-blocking mode (errno %d)", socket_error);
+        socket->shutdown(SHUT_RDWR);
+        return;
+    }
 
 #if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 1, 0)
     std::string identifier = std::string{esphome::socket::SOCKADDR_STR_LEN, 0};
@@ -159,7 +214,7 @@ void StreamServerComponent::flush() {
 
         if ((written = client.socket->writev(iov, 2)) > 0) {
             client.position += written;
-        } else if (written == 0 || errno == ECONNRESET || errno == ENOTCONN || errno == ENETRESET) {
+        } else if (written == 0 || errno == ECONNRESET || errno == ENOTCONN || errno == ENETRESET || errno == EPIPE) {
             ESP_LOGD(TAG, "Client %s disconnected", client.identifier.c_str());
             client.disconnected = true;
             continue;
@@ -198,7 +253,7 @@ void StreamServerComponent::write() {
 
         const int socket_error = errno;
 
-        if (socket_error == ECONNRESET || socket_error == ENOTCONN || socket_error == ENETRESET) {
+        if (socket_error == ECONNRESET || socket_error == ENOTCONN || socket_error == ENETRESET || socket_error == EPIPE) {
             ESP_LOGD(TAG, "Client %s disconnected with error %d", client.identifier.c_str(), socket_error);
             client.disconnected = true;
             continue;
